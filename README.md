@@ -40,7 +40,15 @@ If you require only standard WireGuard protocol support:
 
 cargo build --release
 
+If you require AmneziaWG protocol support:
+
+cargo build --features amnezia --release
+
 # --- Standard WireGuard Settings ---
+
+See official wireguard docs for more info:
+
+https://www.wireguard.com/
 
 PrivateKey = YOUR_SERVER_PRIVATE_KEY
 
@@ -55,6 +63,10 @@ PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o 
 PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
 
 # --- AmneziaWG Obfuscation Settings (Optional) ---
+
+See official AmneziaWG docs for more info:
+
+https://docs.amnezia.org/documentation/amnezia-wg/
 
 # These values mimic the AmneziaWG v1 protocol spec
 
@@ -163,3 +175,9 @@ This project is an independent implementation and is not affiliated with the off
 project. Main Idea is create light and efficient AWG server with possible compilation for OpenWRT routers.
 
 # Enjoy your secure connection. Keep your opsec tight and the DPI blind! ☕
+
+Wireguard is a registered trademark of Jason A. Donenfeld
+
+AmneziaWG is fork of wireguard, made by amnezia team
+
+https://github.com/amnezia-vpn/amneziawg-go
