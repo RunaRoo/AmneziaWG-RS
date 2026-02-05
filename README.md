@@ -162,4 +162,4 @@ This project is an independent implementation and is not affiliated with the off
 
 project. Main Idea is create light and efficient AWG server with possible compilation for OpenWRT routers.
 
-# Enjoy your secure connection and don't let opsec or DPI playing around with your data! ☕
+# Enjoy your secure connection. Keep your opsec tight and the DPI blind! ☕
