@@ -1,7 +1,9 @@
 // src/utils.rs
 use bytes::Bytes;
+use crossbeam_queue::SegQueue;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MessageType {
@@ -85,37 +87,44 @@ impl IPPacketUtils {
     }
 }
 
-//NEW MEMORY POOL SYSTEM
+// =============================================================================
+// NEW: Lock-free BufferPool with capacity limit
+// =============================================================================
 pub struct BufferPool {
-    pool: Mutex<Vec<Vec<u8>>>,
-    capacity: usize,
+    pool: SegQueue<Vec<u8>>,
+    max_entries: usize,          // derived from --buffer-size
+    packet_capacity: usize,
 }
 
 impl BufferPool {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(max_bytes: u64, packet_capacity: usize) -> Self {
+        let max_entries = (max_bytes / packet_capacity as u64).max(512) as usize;
         Self {
-            pool: Mutex::new(Vec::new()),
-            capacity,
+            pool: SegQueue::new(),
+            max_entries,
+            packet_capacity,
         }
     }
 
+    /// Acquire a buffer (from pool or new allocation)
     pub fn acquire(&self) -> Vec<u8> {
-        let mut guard = self.pool.lock().unwrap();
-        if let Some(mut buf) = guard.pop() {
-            buf.clear(); // Reset length to 0, capacity remains
+        if let Some(mut buf) = self.pool.pop() {
+            buf.clear();
             buf
         } else {
-            Vec::with_capacity(self.capacity)
+            // Allocate new zeroed buffer of fixed capacity
+            vec![0u8; self.packet_capacity]
         }
     }
 
+    /// Release buffer back to pool (respects capacity limit)
     pub fn release(&self, mut buf: Vec<u8>) {
-        if buf.capacity() >= self.capacity {
-            let mut guard = self.pool.lock().unwrap();
-            // Cap the pool size to prevent infinite growth if bursts happen
-            if guard.len() < 1000 {
-                guard.push(buf);
-            }
+        // Only recycle if capacity matches (prevents weirdly sized buffers from polluting pool)
+        // and if we haven't exceeded our max memory usage.
+        if buf.capacity() == self.packet_capacity && self.pool.len() < self.max_entries {
+            buf.clear();
+            self.pool.push(buf);
         }
+        // else drop (prevents memory explosion on extreme bursts)
     }
 }

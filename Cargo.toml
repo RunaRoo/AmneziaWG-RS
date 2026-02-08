@@ -16,6 +16,10 @@ base64 = "0.21"
 log = "0.4"
 env_logger = "0.10"
 rand = "0.8"
+#Concurrency
+crossbeam-channel = "0.5"
+#crossbeam-queue = "0.3"
+num_cpus = "1.16"
 # Cryptography
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"

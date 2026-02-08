@@ -1,5 +1,4 @@
 // src/peer.rs
-use std::cmp::Ordering as CmpOrdering;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
@@ -17,7 +16,7 @@ use rand::RngCore;
 
 use crate::config::PeerConfig;
 use crate::cryptography::*;
-use crate::device::TunDevice; // Import Trait
+use crate::device::TunDevice;
 use crate::message::*;
 use crate::node::Node;
 use crate::noise::*;
@@ -49,24 +48,38 @@ pub struct KeyPair {
 }
 
 impl KeyPair {
-    pub fn encrypt_data(&self, packet: &[u8]) -> Option<DataMessage> {
+    /// Offloads encryption to a background thread pool via smol::unblock.
+    /// This prevents CPU-bound crypto from stalling the async executor.
+    pub async fn encrypt_data(&self, packet: Vec<u8>) -> Option<DataMessage> {
         let nonce = self.tx_nonce.fetch_add(1, Ordering::SeqCst);
-        let encrypted = chacha20_poly1305_encrypt(&self.send_key, nonce, packet, &[])?;
+        let key = self.send_key.clone();
+
+        let encrypted = smol::unblock(move || {
+            chacha20_poly1305_encrypt(&key, nonce, &packet, &[])
+        }).await?;
 
         self.last_packet_sent_timestamp.store(now_ms(), Ordering::SeqCst);
         Some(DataMessage {
             receiver_index: self.remote_index,
             counter: nonce,
             encrypted_data: encrypted,
-            wire_header: 4,  //Critical for Wireguard compatibility !1!1!1!1 (Header is 4 (deobf))
+            wire_header: 4, // Amnezia/Wireguard data header
         })
     }
 
-    pub fn decrypt_data(&self, message: &DataMessage) -> Option<Bytes> {
+    /// Offloads decryption to a background thread pool.
+    pub async fn decrypt_data(&self, message: DataMessage) -> Option<Bytes> {
         if !self.rx_replay_filter.validate(message.counter) {
             return None;
         }
-        chacha20_poly1305_decrypt(&self.recv_key, message.counter, &message.encrypted_data, &[])
+
+        let key = self.recv_key.clone();
+        let counter = message.counter;
+        let data = message.encrypted_data;
+
+        smol::unblock(move || {
+            chacha20_poly1305_decrypt(&key, counter, &data, &[])
+        }).await
     }
 }
 
@@ -123,29 +136,23 @@ impl ReplayFilter {
         }
     }
 }
-//Peer is now async
+
 pub struct Peer<D: TunDevice + 'static> {
     pub public_key: Key,
     pub current_endpoint: RwLock<Option<SocketAddr>>,
     last_packet_received_timestamp: AtomicI64,
     noise: Noise,
-
     current_key_pair: RwLock<Option<Arc<KeyPair>>>,
     next_key_pair: RwLock<Option<Arc<KeyPair>>>,
-
     handshake_secrets: RwLock<Option<HandshakeSecrets>>,
     last_initiation_message: RwLock<Option<HandshakeInitiationMessage>>,
     last_handshake_sent_timestamp: AtomicI64,
     is_handshake_in_progress: AtomicBool,
-
     mailbox: Sender<PeerEvent>,
     outbound_queue: Sender<Vec<u8>>,
     packet_queue: Mutex<VecDeque<Vec<u8>>>,
-
-    //Node is now Node<D> (async)
     node: Arc<Node<D>>,
     pub peer_config: PeerConfig,
-
     last_activity: AtomicI64,
     keepalive_timeout_ms: i64,
     pub rx_bytes: AtomicU64,
@@ -160,7 +167,6 @@ impl<D: TunDevice + 'static> PartialEq for Peer<D> {
 }
 
 impl<D: TunDevice + 'static> Peer<D> {
-    // FIX: Constructor now takes Node<D>
     pub fn new(node: Arc<Node<D>>, peer_config: PeerConfig) -> Arc<Self> {
         let config_endpoint = peer_config.endpoint;
         let remote_public = Key::from_base64(&peer_config.public_key);
@@ -170,12 +176,6 @@ impl<D: TunDevice + 'static> Peer<D> {
         let (mailbox_tx, mailbox_rx) = bounded(1024);
         let (outbound_tx, outbound_rx) = bounded(2048);
         let keepalive_timeout = peer_config.persistent_keepalive.map(|k| k as i64 * 1000).unwrap_or(0);
-
-        if let Some(ep) = config_endpoint {
-            info!("Peer {}: Configured with ENDPOINT {}. Role: INITIATOR.", remote_public.to_base64(), ep);
-        } else {
-            info!("Peer {}: NO ENDPOINT configured. Role: RESPONDER (Passive).", remote_public.to_base64());
-        }
 
         let peer = Arc::new(Self {
             public_key: remote_public,
@@ -260,8 +260,10 @@ impl<D: TunDevice + 'static> Peer<D> {
 
         if let (Some(kp), Some(target)) = (current_kp_opt, endpoint_opt) {
             for packet in packets {
-                if let Some(encrypted) = kp.encrypt_data(&packet) {
-                    self.tx_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
+                let len = packet.len();
+                // Async encryption call
+                if let Some(encrypted) = kp.encrypt_data(packet.clone()).await {
+                    self.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
                     self.send_data_packet(encrypted, target).await;
                 }
                 self.node.buffer_pool.release(packet);
@@ -307,7 +309,8 @@ impl<D: TunDevice + 'static> Peer<D> {
 
             if let (Some(kp), Some(target)) = (current, endpoint) {
                 let len = packet.len() as u64;
-                if let Some(encrypted_msg) = kp.encrypt_data(&packet) {
+                // Async encryption call
+                if let Some(encrypted_msg) = kp.encrypt_data(packet.clone()).await {
                     self.tx_bytes.fetch_add(len, Ordering::Relaxed);
                     self.send_data_packet(encrypted_msg, target).await;
                 }
@@ -318,7 +321,7 @@ impl<D: TunDevice + 'static> Peer<D> {
         }
     }
 
-    //Amnezia Helper Methods
+    // Amnezia Helper Methods
 
     #[cfg(feature = "amnezia")]
     async fn send_junk_packets(&self, endpoint: SocketAddr) {
@@ -371,38 +374,17 @@ impl<D: TunDevice + 'static> Peer<D> {
     #[cfg(feature = "amnezia")]
     async fn send_obfuscated_data(&self, msg: DataMessage, endpoint: SocketAddr) {
         let am = &self.node.amnezia_config;
-
-        // 1. Generate the Amnezia Header (H4)
         let header = self.node.random_header(&am.h4);
-
-        // 2. Calculate exact buffer size
-        // Header(4) + Index(4) + Counter(8) + EncryptedData(N)
         let payload_len = msg.encrypted_data.len();
         let mut full = Vec::with_capacity(4 + 4 + 8 + payload_len);
 
-        // 3. Construct packet strictly (Little Endian)
-        full.put_u32_le(header);              // Bytes 0-3: H4 Magic
-        full.put_u32_le(msg.receiver_index);  // Bytes 4-7: Receiver Index
-        full.put_u64_le(msg.counter);         // Bytes 8-15: Counter
-        full.extend_from_slice(&msg.encrypted_data); // Bytes 16+: Data + Tag
+        full.put_u32_le(header);              // H4 Magic
+        full.put_u32_le(msg.receiver_index);  // Receiver Index
+        full.put_u64_le(msg.counter);         // Counter
+        full.extend_from_slice(&msg.encrypted_data);
 
-        // 4. Send
         self.node.send_udp_packet(full.into(), endpoint).await;
     }
-    /* //Todo: Not working
-    #[cfg(feature = "amnezia")]
-    async fn send_obfuscated_data(&self, msg: DataMessage, endpoint: SocketAddr) {
-        let am = &self.node.amnezia_config;
-        let standard = msg.to_bytes();
-        let payload = &standard[4..];
-        let header = self.node.random_header(&am.h4);
-
-        let mut full = Vec::with_capacity(4 + payload.len());
-        full.put_u32_le(header);
-        full.extend_from_slice(payload);
-        self.node.send_udp_packet(full.into(), endpoint).await;
-    }
-     */
 
     #[cfg(feature = "amnezia")]
     async fn send_obfuscated_cookie(&self, msg: CookieReplyMessage, endpoint: SocketAddr) {
@@ -542,7 +524,7 @@ impl<D: TunDevice + 'static> Peer<D> {
             Ok(mut g) => *g = Some(Arc::new(key_pair)),
             Err(e) => *e.into_inner() = Some(Arc::new(key_pair)),
         }
-        
+
         let secrets = HandshakeSecrets {
             chaining_key: ck,
             hash: hs,
@@ -637,16 +619,15 @@ impl<D: TunDevice + 'static> Peer<D> {
                 if msg.receiver_index == nxt.local_index { Some(nxt.clone()) } else { None }
             } else { None }
         } else {
-            if let Some(nxt) = &next {
-                if msg.receiver_index == nxt.local_index { Some(nxt.clone()) } else { None }
-            } else { None }
+            next.as_ref().filter(|nxt| msg.receiver_index == nxt.local_index).cloned()
         };
 
         if let Some(kp) = matching_kp {
-            if let Some(decrypted) = kp.decrypt_data(&msg) {
+            // Async decryption call
+            if let Some(decrypted) = kp.decrypt_data(msg).await {
                 self.update_endpoint(sender);
 
-                if decrypted.len() > 0 {
+                if !decrypted.is_empty() {
                     self.rx_bytes.fetch_add(decrypted.len() as u64, Ordering::Relaxed);
                     if let Some(source_ip) = IPPacketUtils::get_source_address(&decrypted) {
                         if self.node.validate_packet_source(source_ip, self) {
@@ -655,7 +636,7 @@ impl<D: TunDevice + 'static> Peer<D> {
                     }
                 }
 
-                let is_next = if let Some(n) = &next { n.local_index == kp.local_index } else { false };
+                let is_next = next.as_ref().map_or(false, |n| n.local_index == kp.local_index);
                 if is_next {
                     debug!("Confirmed next session. Rotating keys.");
                     if let Some(old) = current { self.node.remove_session(old.local_index); }
@@ -723,7 +704,7 @@ impl<D: TunDevice + 'static> Peer<D> {
                 mac2: Bytes::from(vec![0u8; 16]),
                 wire_header,
             };
-            
+
             let secrets = HandshakeSecrets {
                 chaining_key: ck,
                 hash: hs,
@@ -764,7 +745,6 @@ impl<D: TunDevice + 'static> Peer<D> {
                 }
                 self.send_obfuscated_handshake_initiation(msg, target).await;
             }
-
         }
     }
 
@@ -836,7 +816,8 @@ impl<D: TunDevice + 'static> Peer<D> {
         let endpoint = match self.current_endpoint.read() { Ok(g) => g.clone(), Err(e) => e.into_inner().clone() };
 
         if let (Some(kp), Some(target)) = (current, endpoint) {
-            if let Some(enc) = kp.encrypt_data(&[]) {
+            // Async encryption call for keepalive
+            if let Some(enc) = kp.encrypt_data(vec![]).await {
                 self.send_data_packet(enc, target).await;
             }
         }
