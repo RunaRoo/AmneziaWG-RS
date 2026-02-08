@@ -18,7 +18,6 @@ use std::io::Write;
 use cryptography::{generate_keypair, Key};
 use std::fs::{File, OpenOptions};
 use smol::Executor;
-use num_cpus;
 
 // Struct for dual writing (Stdout + File)
 struct TeeWriter {
@@ -47,7 +46,7 @@ impl Write for TeeWriter {
     }
 }
 
-// Helper for buffer size parsing
+// Helper for buffer size parsing (e.g., "1g", "512m")
 fn parse_buffer_size(s: &str) -> u64 {
     let lower = s.to_lowercase();
     let cleaned: String = lower.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
@@ -74,9 +73,11 @@ fn main() -> std::io::Result<()> {
     let mut print_stats = false;
     let mut command: Option<String> = None;
 
-    // Multi-thread defaults
+    // Multi-thread and Cache defaults
     let mut num_threads: usize = num_cpus::get().min(16);
-    let mut buffer_size: u64 = 32 * 1024 * 1024; // 32 MiB default
+    let mut buffer_size: u64 = 32 * 1024 * 1024;
+    let mut route_ttl_secs: i64 = 300;
+    let mut route_max_entries: usize = 500_000;
 
     // --- Argument Parsing ---
     let mut i = 1;
@@ -121,6 +122,18 @@ fn main() -> std::io::Result<()> {
                     i += 2;
                 } else { i += 1; }
             }
+            "--route-cache-ttl" => {
+                if i + 1 < args.len() {
+                    route_ttl_secs = args[i+1].parse().unwrap_or(300);
+                    i += 2;
+                } else { i += 1; }
+            }
+            "--route-cache-max" => {
+                if i + 1 < args.len() {
+                    route_max_entries = args[i+1].parse().unwrap_or(500_000);
+                    i += 2;
+                } else { i += 1; }
+            }
             cmd if !cmd.starts_with("-") && command.is_none() && (cmd == "genkey" || cmd == "pubkey" || cmd == "genpsk") => {
                 command = Some(cmd.to_string());
                 i += 1;
@@ -133,7 +146,7 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    // Command Handling
+    // Command Handling (Key generation utilities)
     if let Some(cmd) = command {
         match cmd.as_str() {
             "genkey" | "genpsk" => {
@@ -158,11 +171,9 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    // Log Setup
+    // Logger Initialization
     let log_file = if let Some(path) = log_file_path {
-        Some(Arc::new(Mutex::new(
-            OpenOptions::new().create(true).append(true).open(path)?,
-        )))
+        Some(Arc::new(Mutex::new(OpenOptions::new().create(true).append(true).open(path)?)))
     } else { None };
 
     let logger = Box::new(TeeWriter { file: log_file });
@@ -170,23 +181,17 @@ fn main() -> std::io::Result<()> {
     env_logger::Builder::new()
         .filter_level(log_level)
         .format(|buf, record| {
-            writeln!(
-                buf,
-                "[{}] {}: {}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                record.level(),
-                record.args()
-            )
+            writeln!(buf, "[{}] {}: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), record.level(), record.args())
         })
         .target(env_logger::Target::Pipe(logger))
         .init();
 
-    info!("WireGuard-W-RS (Linux Only)");
-    info!("Scale Settings: threads={}, buffer_limit={} MiB", num_threads, buffer_size / (1024 * 1024));
+    info!("Starting WireGuard-W-RS (Linux)");
+    info!("Workers: {}, Buffer: {} MiB, Cache TTL: {}s, Cache Max: {}", 
+        num_threads, buffer_size / (1024 * 1024), route_ttl_secs, route_max_entries);
 
     // --- Multi-threaded Executor Setup ---
     let executor = Arc::new(Executor::new());
-
     for n in 0..num_threads.saturating_sub(1) {
         let ex = executor.clone();
         std::thread::Builder::new()
@@ -196,14 +201,10 @@ fn main() -> std::io::Result<()> {
             })?;
     }
 
+    // Start Node Logic on Executor
     smol::block_on(executor.run(async {
         let path_obj = std::path::Path::new(&config_path);
-
-        let interface_name = path_obj
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("wg0")
-            .to_string();
+        let interface_name = path_obj.file_stem().and_then(|s| s.to_str()).unwrap_or("wg0").to_string();
 
         if !path_obj.exists() {
             error!("Configuration file not found: {}", config_path);
@@ -222,6 +223,7 @@ fn main() -> std::io::Result<()> {
         let device = Arc::new(LinuxTunDevice::new(&interface_name, iface_config.clone())?);
         device.up(&peer_configs)?;
 
+        // Initialize Node with all scalability parameters
         let node = Node::new(
             iface_config,
             peer_configs,
@@ -231,23 +233,22 @@ fn main() -> std::io::Result<()> {
             buffer_size
         ).await;
 
+        // Apply dynamic cache parameters
+        node.set_cache_params(route_ttl_secs, route_max_entries);
+
         #[cfg(feature = "amnezia")]
-        info!("AmneziaWG features enabled");
+        info!("AmneziaWG Protocol Extensions Enabled");
 
         node.start().await;
 
         let (ctrlc_tx, ctrlc_rx) = smol::channel::bounded(1);
-        ctrlc::set_handler(move || {
-            let _ = ctrlc_tx.try_send(());
-        }).expect("Error setting Ctrl-C handler");
+        ctrlc::set_handler(move || { let _ = ctrlc_tx.try_send(()); }).expect("Error setting Ctrl-C handler");
 
-        info!("Interface {} up. Listening...", device.name());
-
+        info!("Interface {} is active. Press Ctrl+C to stop.", device.name());
         let _ = ctrlc_rx.recv().await;
 
-        info!("Shutting down interface...");
+        info!("Shutting down...");
         let _ = device.down();
-
         Ok::<(), std::io::Error>(())
     }))
 }
@@ -256,15 +257,17 @@ fn print_help() {
     println!("Usage: wireguard-w-rs [FLAGS] [CONFIG_PATH] [COMMAND]");
     println!();
     println!("Flags:");
-    println!("  --log-level <LEVEL>     Set log level (error, warn, info, debug, trace). Default: info");
-    println!("  --log-to-file <PATH>    Write logs to specified file in addition to stdout");
-    println!("  --print-stats           Periodically write peer statistics to stats.txt");
-    println!("  --threads <NUM>         Number of worker threads for parallel crypto (Default: CPU count)");
-    println!("  --buffer-size <SIZE>    Global memory limit for packet buffers (e.g. 512m, 1g). Default: 32m");
+    println!("  --log-level <LEVEL>     Set log level (error, warn, info, debug, trace)");
+    println!("  --log-to-file <PATH>    Log to file and stdout");
+    println!("  --print-stats           Enable statistics dumping to 'stats.txt'");
+    println!("  --threads <NUM>         Worker threads for parallel crypto (Default: CPU count)");
+    println!("  --buffer-size <SIZE>    Memory buffer limit (e.g., 512m, 1g)");
+    println!("  --route-cache-ttl <S>   Seconds an idle route remains in cache (Default: 300)");
+    println!("  --route-cache-max <N>   Maximum allowed entries in route cache (Default: 500,000)");
     println!("  -h, --help              Print this help screen");
     println!();
     println!("Commands:");
     println!("  genkey                  Generate a new private key");
     println!("  genpsk                  Generate a new preshared key");
-    println!("  pubkey                  Read private key from stdin and output public key");
+    println!("  pubkey                  Convert private key (stdin) to public key");
 }

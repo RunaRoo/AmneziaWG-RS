@@ -21,11 +21,16 @@ use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_UDP_PACKET: usize = 65535;
+
+// Defaults
+const DEFAULT_ROUTE_CACHE_TTL_SECS: i64 = 300;
+const DEFAULT_ROUTE_CACHE_MAX_ENTRIES: usize = 500_000;
+const CLEANUP_INTERVAL_MS: i64 = 30_000;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Range {
@@ -84,8 +89,11 @@ pub struct Node<D: TunDevice + 'static> {
     pub(crate) device: Arc<D>,
     pub peers_by_public_key: Arc<DashMap<Key, Arc<Peer<D>>>>,
     sessions: DashMap<u32, Key>,
-    route_cache: DashMap<IpAddr, Arc<Peer<D>>>,
+
+    // Hybrid Route Cache
+    route_cache: DashMap<IpAddr, (Arc<Peer<D>>, i64)>,
     routing_table: RoutingTable<Arc<Peer<D>>>,
+
     pub(crate) server_private_key: Key,
     pub(crate) server_public_key: Key,
     pub(crate) cookie_generator: CookieGenerator,
@@ -95,7 +103,9 @@ pub struct Node<D: TunDevice + 'static> {
     pub(crate) amnezia_config: AmneziaConfig,
     pub(crate) buffer_pool: Arc<BufferPool>,
     num_workers: usize,
-    max_buffer_bytes: u64,
+    
+    cache_ttl_ms: AtomicI64,
+    cache_max_entries: AtomicUsize,
 }
 
 impl<D: TunDevice + 'static> Node<D> {
@@ -105,7 +115,7 @@ impl<D: TunDevice + 'static> Node<D> {
         device: Arc<D>,
         print_stats: bool,
         num_workers: usize,
-        max_buffer_bytes: u64,
+        max_buffer_bytes: u64, // Used only for pool init
     ) -> Arc<Self> {
         let private_key = Key::try_from_base64(&iface_config.private_key).expect("Invalid Private Key");
         let public_key = private_to_public_key(&private_key);
@@ -148,7 +158,8 @@ impl<D: TunDevice + 'static> Node<D> {
             amnezia_config,
             buffer_pool,
             num_workers: num_workers.max(1),
-            max_buffer_bytes,
+            cache_ttl_ms: AtomicI64::new(DEFAULT_ROUTE_CACHE_TTL_SECS * 1000),
+            cache_max_entries: AtomicUsize::new(DEFAULT_ROUTE_CACHE_MAX_ENTRIES),
         });
 
         for peer_config in peer_configs {
@@ -159,6 +170,13 @@ impl<D: TunDevice + 'static> Node<D> {
             }
         }
         self_arc
+    }
+
+    /// Correctly applies parameters from main.rs flags
+    pub fn set_cache_params(&self, ttl_secs: i64, max_entries: usize) {
+        self.cache_ttl_ms.store(ttl_secs * 1000, Ordering::Relaxed);
+        self.cache_max_entries.store(max_entries, Ordering::Relaxed);
+        info!("Applied dynamic cache settings: TTL={}s, MaxEntries={}", ttl_secs, max_entries);
     }
 
     #[cfg(feature = "amnezia")]
@@ -175,7 +193,7 @@ impl<D: TunDevice + 'static> Node<D> {
     }
 
     pub async fn start(self: Arc<Self>) {
-        let queue_depth = 10240; // High capacity for millions of clients
+        let queue_depth = 10240;
         let mut worker_senders = Vec::with_capacity(self.num_workers);
 
         for _ in 0..self.num_workers {
@@ -194,6 +212,10 @@ impl<D: TunDevice + 'static> Node<D> {
         }
     }
 
+    fn now_ms(&self) -> i64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    }
+
     async fn udp_receiver(self: Arc<Self>, senders: Vec<Sender<(Bytes, SocketAddr)>>) {
         let num_shards = senders.len();
         loop {
@@ -204,12 +226,9 @@ impl<D: TunDevice + 'static> Node<D> {
                 Ok((n, sender_addr)) if n >= 4 => {
                     unsafe { buf.set_len(n); }
                     let raw = Bytes::from(buf);
-
                     let mut hasher = DefaultHasher::new();
                     sender_addr.hash(&mut hasher);
                     let shard_idx = (hasher.finish() as usize) % num_shards;
-
-                    // Await send for backpressure (prevents OOM under millions of clients)
                     let _ = senders[shard_idx].send((raw, sender_addr)).await;
                 }
                 _ => { self.buffer_pool.release(buf); }
@@ -325,12 +344,19 @@ impl<D: TunDevice + 'static> Node<D> {
             if let Ok(n) = self.device.read(&mut buf).await {
                 unsafe { buf.set_len(n); }
                 if let Some(dest) = IPPacketUtils::get_destination_address(&buf) {
-                    if let Some(peer) = self.route_cache.get(&dest) {
-                        peer.value().on_tun_packet(buf);
+                    let now = self.now_ms();
+
+                    if let Some(mut entry) = self.route_cache.get_mut(&dest) {
+                        entry.1 = now;
+                        entry.0.on_tun_packet(buf);
                         continue;
                     }
+
                     if let Some(peer) = self.routing_table.find_best_match(dest) {
-                        self.route_cache.insert(dest, peer.clone());
+                        // Use atomic max entries check
+                        if self.route_cache.len() < self.cache_max_entries.load(Ordering::Relaxed) {
+                            self.route_cache.insert(dest, (peer.clone(), now));
+                        }
                         peer.on_tun_packet(buf);
                     } else { self.buffer_pool.release(buf); }
                 } else { self.buffer_pool.release(buf); }
@@ -339,10 +365,62 @@ impl<D: TunDevice + 'static> Node<D> {
     }
 
     async fn peer_timers(self: Arc<Self>) {
+        let mut last_cache_purge = self.now_ms();
+
         loop {
             Timer::after(Duration::from_secs(1)).await;
+            let now = self.now_ms();
+
             for entry in self.peers_by_public_key.iter() {
                 entry.value().tick();
+            }
+
+            // Route Cache Maintenance
+            if (now - last_cache_purge) > CLEANUP_INTERVAL_MS {
+                let mut removed = 0;
+                let ttl_threshold = self.cache_ttl_ms.load(Ordering::Relaxed);
+                let max_threshold = self.cache_max_entries.load(Ordering::Relaxed);
+
+                // 1. TTL-based cleanup
+                let to_remove: Vec<IpAddr> = self.route_cache
+                    .iter()
+                    .filter(|entry| (now - entry.value().1) > ttl_threshold)
+                    .map(|entry| *entry.key())
+                    .collect();
+
+                for key in to_remove {
+                    self.route_cache.remove(&key);
+                    removed += 1;
+                }
+
+                // 2. Size-based Partial Eviction (Oldest entries)
+                if self.route_cache.len() > max_threshold {
+                    let current_len = self.route_cache.len();
+                    let target_len = (max_threshold as f64 * 0.9) as usize;
+                    let count_to_evict = current_len.saturating_sub(target_len);
+
+                    warn!("Route cache size over cap ({}). Evicting oldest {} entries.", current_len, count_to_evict);
+
+                    let mut entries: Vec<(IpAddr, i64)> = self.route_cache
+                        .iter()
+                        .map(|entry| (*entry.key(), entry.value().1))
+                        .collect();
+
+                    entries.sort_by_key(|&(_, ts)| ts);
+
+                    for (key, _) in entries.iter().take(count_to_evict) {
+                        self.route_cache.remove(key);
+                        removed += 1;
+                    }
+
+                    info!("Emergency eviction complete. New cache size: {}", self.route_cache.len());
+                }
+
+                if removed > 0 {
+                    debug!("Route cache cleanup: removed {} stale/overflow entries.", removed);
+                }
+
+                last_cache_purge = now;
             }
         }
     }
@@ -352,10 +430,10 @@ impl<D: TunDevice + 'static> Node<D> {
         loop {
             Timer::after(Duration::from_secs(5)).await;
             if let Ok(mut file) = File::create(&stats_path) {
-                let mut output = format!("interface: {}\nworkers: {}\n", self.device.name(), self.num_workers);
+                let mut output = format!("interface: {}\nworkers: {}\ncache_size: {}\n",
+                                         self.device.name(), self.num_workers, self.route_cache.len());
                 for entry in self.peers_by_public_key.iter() {
                     let p = entry.value();
-                    let ep = p.current_endpoint.read().unwrap().map_or("none".into(), |a| a.to_string());
                     output.push_str(&format!("peer: {}\n  rx/tx: {} / {}\n",
                                              p.public_key.to_base64(), human_bytes(p.rx_bytes.load(Ordering::Relaxed)), human_bytes(p.tx_bytes.load(Ordering::Relaxed))));
                 }
@@ -367,7 +445,6 @@ impl<D: TunDevice + 'static> Node<D> {
     pub fn is_under_load(&self) -> bool { false }
 
     pub fn validate_packet_source(&self, source_ip: IpAddr, peer: &Peer<D>) -> bool {
-        // FIXED: Manual bitmask check for massive scalability
         peer.peer_config.allowed_ips.iter().any(|cidr| {
             match (source_ip, cidr.address) {
                 (IpAddr::V4(s), IpAddr::V4(n)) => {
