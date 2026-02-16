@@ -198,24 +198,30 @@ mod linux {
 
     fn create_tun_interface(name: &str) -> io::Result<(File, String)> {
         let path = CString::new("/dev/net/tun").expect("CString::new failed");
+        
+        // Open the clone device
         let fd = unsafe { libc::open(path.as_ptr(), O_RDWR | O_NONBLOCK) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
 
+        // Prepare ifreq structure
         let mut ifr: ifreq = unsafe { mem::zeroed() };
-        // FIX: Cast flags to c_short (i16) to match struct definition
         ifr.ifr_flags = (IFF_TUN | IFF_NO_PI) as c_short;
 
         let name_bytes = name.as_bytes();
         if name_bytes.len() >= IFNAMSIZ {
+            unsafe { libc::close(fd) }; // Don't forget to close fd on error
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Interface name too long"));
         }
+        
+        // Copy name bytes safely
         for (i, &byte) in name_bytes.iter().enumerate() {
             ifr.ifr_name[i] = byte;
         }
 
-        let res = unsafe { libc::ioctl(fd, TUNSETIFF, &mut ifr) };
+        let res = unsafe { libc::ioctl(fd, TUNSETIFF as libc::c_int, &mut ifr) };
+        
         if res < 0 {
             let err = io::Error::last_os_error();
             unsafe { libc::close(fd) };
@@ -228,10 +234,11 @@ mod linux {
                 .into_owned()
         };
 
+        // Wrap raw fd in File
         let file = unsafe { File::from_raw_fd(fd) };
+        
         Ok((file, actual_name))
     }
-}
 
 // =========================================================================
 // 3. WINDOWS STUB
