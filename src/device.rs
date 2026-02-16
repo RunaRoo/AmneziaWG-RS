@@ -272,6 +272,7 @@ impl TunDevice for LinuxTunDevice {
     fn down(&self) -> io::Result<()> { Ok(()) }
     fn run_command(&self, _command: &str) -> io::Result<()> { Ok(()) }
 }
+}
 
 // /////
 //Legacy Linux Implementation
